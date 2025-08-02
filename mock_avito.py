@@ -8,6 +8,8 @@ import time
 import uuid
 from fastapi import FastAPI, Form, HTTPException, Header, Request
 import logging
+import hmac, hashlib, base64, httpx
+import json
 
 app = FastAPI(title="Mock Avito API")
 
@@ -98,3 +100,73 @@ async def list_chats(Authorization: str = Header(...)):
             {"chat_id": 2, "title": "Mock chat #2"},
         ]
     }
+
+
+# ---------------------------------------------------------------------------
+# Web-hook subscription & test events
+# ---------------------------------------------------------------------------
+
+SUBSCRIBERS: dict[str, dict] = {}      # id -> {url, secret}
+
+def _sign(body: bytes, secret: str) -> str:
+    return base64.b64encode(
+        hmac.new(secret.encode(), body, hashlib.sha256).digest()
+    ).decode()
+
+@app.post("/messenger/v3/webhook")
+async def subscribe_webhook(data: dict):
+    """
+    Официальный путь у Avito: POST /messenger/v3/webhook
+    Тело: {"url": "...", "secret": "optional"}
+    """
+    url = data.get("url")
+    if not url:
+        raise HTTPException(400, "'url' required")
+
+    sub_id = uuid.uuid4().hex
+    SUBSCRIBERS[sub_id] = {"url": url, "secret": data.get("secret", "changeme")}
+    logger.info("Webhook subscribed: %s → %s", sub_id, url)
+    return {"id": sub_id, "ok": True}
+
+@app.delete("/messenger/v3/webhook/{sub_id}")
+async def unsubscribe_webhook(sub_id: str):
+    if SUBSCRIBERS.pop(sub_id, None) is None:
+        raise HTTPException(404, "no such subscription")
+    logger.info("Webhook %s removed", sub_id)
+    return {"ok": True}
+
+async def _broadcast(event: dict):
+    """Шлём одно и то же событие всем подписчикам."""
+    async with httpx.AsyncClient(timeout=10) as client:
+        for sid, cfg in SUBSCRIBERS.items():
+            body = json.dumps(event).encode()
+            sig  = _sign(body, cfg["secret"])
+            try:
+                r = await client.post(
+                    cfg["url"],
+                    content=body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Hook-Signature": sig,
+                    },
+                )
+                logger.info("→ webhook %s %s %s", sid, r.status_code, r.text[:200])
+            except Exception as exc:
+                logger.warning("Webhook %s failed: %s", sid, exc)
+
+@app.post("/messenger/v3/_simulate_inbound")
+async def simulate_inbound(text: str = Form(...), chat_id: int = Form(1)):
+    """Локальный помощник: делает «входящее сообщение» и шлёт Web-hook."""
+    event = {
+        "id": uuid.uuid4().hex,
+        "timestamp": int(time.time()),
+        "version": "3",
+        "payload": {
+            "message": {
+                "chat_id": chat_id,
+                "text": text,
+            }
+        },
+    }
+    await _broadcast(event)
+    return {"sent": True, "subscribers": len(SUBSCRIBERS)}
