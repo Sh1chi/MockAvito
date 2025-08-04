@@ -4,23 +4,20 @@ Run with:
 Then point TOKEN_URL in your main service to http://localhost:9000/token
 """
 
-import time
-import uuid
+import time, uuid, logging, hmac, hashlib, base64, httpx, json
 from fastapi import FastAPI, Form, HTTPException, Header, Request
-import logging
-import hmac, hashlib, base64, httpx
-import json
+from typing import Dict
 
 app = FastAPI(title="Mock Avito API")
-
-# In-memory store: refresh_token -> (access_token, expires_at)
-TOKENS = {}
-
-TOKEN_LIFETIME = 3600  # seconds
-
 # Setup basic logging
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s")
 logger = logging.getLogger("mock_avito")
+
+# In-memory store: refresh_token -> (access_token, expires_at)
+TOKENS: Dict[str, tuple[str, int]] = {}           # refresh → (access, expires_at)
+TOKEN_LIFETIME = 3600                             # 1 час
+
+
 
 def _gen_token() -> str:
     """Create a random 32-char hex string."""
@@ -108,23 +105,35 @@ async def list_chats(Authorization: str = Header(...)):
 
 SUBSCRIBERS: dict[str, dict] = {}      # id -> {url, secret}
 
-def _sign(body: bytes, secret: str) -> str:
-    return base64.b64encode(
-        hmac.new(secret.encode(), body, hashlib.sha256).digest()
-    ).decode()
+def _sign(secret: str | bytes, body: bytes) -> str:
+    """
+    Возвращает Base64-строку HMAC-SHA256(secret, body),
+    совместимую с заголовком X-Hook-Signature Avito.
+    """
+    if isinstance(secret, str):
+        secret_bytes = secret.encode()
+    else:
+        secret_bytes = secret
+    digest = hmac.new(secret_bytes, body, hashlib.sha256).digest()
+    return base64.b64encode(digest).decode()
+
 
 @app.post("/messenger/v3/webhook")
-async def subscribe_webhook(data: dict):
+async def subscribe_webhook(body: dict):
     """
     Официальный путь у Avito: POST /messenger/v3/webhook
     Тело: {"url": "...", "secret": "optional"}
     """
-    url = data.get("url")
+    url = body.get("url")
     if not url:
         raise HTTPException(400, "'url' required")
 
     sub_id = uuid.uuid4().hex
-    SUBSCRIBERS[sub_id] = {"url": url, "secret": data.get("secret", "changeme")}
+    SUBSCRIBERS[sub_id] = {
+        "url": url,
+        "secret": body.get("secret", "changeme"),
+        "user_id": int(body.get("user_id", 0)),
+    }
     logger.info("Webhook subscribed: %s → %s", sub_id, url)
     return {"id": sub_id, "ok": True}
 
@@ -139,33 +148,52 @@ async def _broadcast(event: dict):
     """Шлём одно и то же событие всем подписчикам."""
     async with httpx.AsyncClient(timeout=10) as client:
         for sid, cfg in SUBSCRIBERS.items():
-            body = json.dumps(event).encode()
-            sig  = _sign(body, cfg["secret"])
+            # Вписываем user_id (идентификатор продавца, «кому принадлежит» webhook)
+            event["payload"]["value"]["user_id"] = cfg["user_id"]
+            data = json.dumps(event).encode()
+            sig = _sign(cfg["secret"], data)
             try:
                 r = await client.post(
                     cfg["url"],
-                    content=body,
+                    content=data,
                     headers={
                         "Content-Type": "application/json",
                         "X-Hook-Signature": sig,
                     },
                 )
-                logger.info("→ webhook %s %s %s", sid, r.status_code, r.text[:200])
+                logger.info("→ webhook %s %s %s", sid, r.status_code, r.text[:120])
             except Exception as exc:
                 logger.warning("Webhook %s failed: %s", sid, exc)
 
+# ---------------------------------------------------------------------------#
+# Помощник: сгенерировать входящее сообщение клиента                         #
+# ---------------------------------------------------------------------------#
 @app.post("/messenger/v3/_simulate_inbound")
-async def simulate_inbound(text: str = Form(...), chat_id: int = Form(1)):
-    """Локальный помощник: делает «входящее сообщение» и шлёт Web-hook."""
+async def simulate_inbound(
+    text: str = Form(...),
+    chat_id: int = Form(1),
+    author_id: int = Form(555),
+):
+    now = int(time.time())
     event = {
         "id": uuid.uuid4().hex,
-        "timestamp": int(time.time()),
+        "timestamp": now,
         "version": "3",
         "payload": {
-            "message": {
+            "type": "message",
+            "value": {
+                "author_id": author_id,
                 "chat_id": chat_id,
-                "text": text,
-            }
+                "chat_type": "u2i",
+                "content": {"text": text},
+                "created": now,
+                "id": uuid.uuid4().hex,
+                "item_id": None,
+                "published_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+                "read": None,
+                "type": "text",
+                # user_id будет добавлен в _broadcast
+            },
         },
     }
     await _broadcast(event)
