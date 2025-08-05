@@ -90,7 +90,7 @@ async def list_chats(Authorization: str = Header(...)):
         logger.warning(f"Unauthorized access with token '{token}'")
         raise HTTPException(401, "Invalid or expired token")
 
-    logger.info(f"Authorized request with token '{token}', returning mock chats")
+
     return {
         "chats": [
             {"chat_id": 1, "title": "Mock chat #1"},
