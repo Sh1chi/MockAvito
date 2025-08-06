@@ -4,9 +4,11 @@
 
 import time, uuid, json, hmac, hashlib, base64, httpx, logging
 from typing import Dict
-from fastapi import APIRouter, HTTPException, Header, Form
+from fastapi import APIRouter, HTTPException, Header, Form, Query, Depends
 
-from .tokens import TOKENS
+from auth_utils import check_bearer_token
+from db import pool                       # уже инициализируется при startup
+from tokens import TOKENS
 
 router  = APIRouter()
 log = logging.getLogger("MockAvito.messenger")
@@ -141,3 +143,49 @@ async def simulate_inbound(
     }
     await _broadcast(event)
     return {"sent": True, "subscribers": len(SUBSCRIBERS)}
+
+
+@router.get(
+    "/messenger/v3/accounts/{user_id}/chats/{chat_id}/messages/",
+    summary="List chat messages (Mock)",
+)
+async def list_messages(
+    user_id: int,
+    chat_id: str,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    _token_ok: None = Depends(check_bearer_token),
+):
+    """
+    Возвращает сообщения чата в формате Avito v3:
+    последние сверху, время – epoch-секунды.
+    """
+    assert pool, "DB pool is not initialised – did you call db.install_pool(app)?"
+
+    sql = """
+    SELECT
+        m.avito_msg_id                             AS id,
+        m.author_id,
+        m.content,
+        EXTRACT(EPOCH FROM m.created_ts)::BIGINT   AS created,
+        m.direction,
+        m.is_read,
+        m.quote,
+        EXTRACT(EPOCH FROM m.read_ts)::BIGINT      AS read,
+        m.msg_type                                 AS type
+    FROM   mock_avito.messages  m
+    JOIN   mock_avito.chats     c ON c.id = m.chat_id
+    WHERE  c.avito_chat_id = $1
+    ORDER  BY m.created_ts DESC
+    LIMIT  $2 OFFSET $3;
+    """
+
+    async with pool.acquire() as conn:        # type: ignore[attr-defined]
+        rows = await conn.fetch(sql, chat_id, limit, offset)
+
+    # Убираем None-поля, Avito их просто не присылает
+    def _clean(record):
+        d = dict(record)
+        return {k: v for k, v in d.items() if v is not None}
+
+    return [_clean(r) for r in rows]
