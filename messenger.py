@@ -7,7 +7,7 @@ from typing import Dict
 from fastapi import APIRouter, HTTPException, Header, Form, Query, Depends
 
 from auth_utils import check_bearer_token
-from db import pool                       # уже инициализируется при startup
+import db                     # уже инициализируется при startup
 from tokens import TOKENS
 
 router  = APIRouter()
@@ -160,7 +160,7 @@ async def list_messages(
     Возвращает сообщения чата в формате Avito v3:
     последние сверху, время – epoch-секунды.
     """
-    assert pool, "DB pool is not initialised – did you call db.install_pool(app)?"
+    assert db.pool, "DB pool is not initialised – did you call db.install_pool(app)?"
 
     sql = """
     SELECT
@@ -180,7 +180,7 @@ async def list_messages(
     LIMIT  $2 OFFSET $3;
     """
 
-    async with pool.acquire() as conn:        # type: ignore[attr-defined]
+    async with db.pool.acquire() as conn:        # type: ignore[attr-defined]
         rows = await conn.fetch(sql, chat_id, limit, offset)
 
     # Убираем None-поля, Avito их просто не присылает
@@ -189,3 +189,76 @@ async def list_messages(
         return {k: v for k, v in d.items() if v is not None}
 
     return [_clean(r) for r in rows]
+
+
+@router.get(
+    "/messenger/v2/accounts/{user_id}/chats/{chat_id}",
+    summary="Chat info + last_message (Mock Avito v2)",
+)
+async def get_chat_info(
+    user_id: int,
+    chat_id: str,
+    _token_ok: None = Depends(check_bearer_token),
+):
+    """
+    Отдаёт структуру Avito v2:
+      {
+        "context": {...},
+        "created": 1571412836,
+        "id": "chat-001",
+        "last_message": { ... },   # берём из messages
+        "updated": 1571654040,
+        "users": [...]
+      }
+    """
+    assert db.pool, "DB pool not initialised – did you forget install_pool(app)?"
+
+    sql_chat = """
+        SELECT
+            id,                      -- internal PK
+            avito_chat_id            AS chat_id,
+            context_type,
+            context_value,
+            EXTRACT(EPOCH FROM created_ts)::BIGINT AS created,
+            EXTRACT(EPOCH FROM updated_ts)::BIGINT AS updated,
+            users
+        FROM mock_avito.chats
+        WHERE avito_chat_id = $1
+    """
+    sql_last_msg = """
+        SELECT
+            avito_msg_id             AS id,
+            author_id,
+            content,
+            EXTRACT(EPOCH FROM created_ts)::BIGINT AS created,
+            direction,
+            msg_type                  AS type
+        FROM mock_avito.messages
+        WHERE chat_id = $1
+        ORDER BY created_ts DESC
+        LIMIT 1
+    """
+
+    async with db.pool.acquire() as conn:             # type: ignore[attr-defined]
+        chat = await conn.fetchrow(sql_chat, chat_id)
+        if not chat:
+            raise HTTPException(404, "Chat not found")
+
+        last = await conn.fetchrow(sql_last_msg, chat["id"])
+
+    def _clean(record):
+        d = dict(record)
+        return {k: v for k, v in d.items() if v is not None}
+
+    response = {
+        "context": {
+            "type": chat["context_type"],
+            "value": chat["context_value"],
+        },
+        "created": chat["created"],
+        "id": chat["chat_id"],
+        "updated": chat["updated"],
+        "users": chat["users"],
+        "last_message": _clean(last) if last else None,
+    }
+    return response

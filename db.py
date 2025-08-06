@@ -15,7 +15,10 @@ def install_pool(app: FastAPI) -> None:
     @app.on_event("startup")
     async def _open_pool() -> None:
         global pool
-        pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+        pool = await asyncpg.create_pool(DATABASE_URL,
+                                         min_size=1,
+                                         max_size=5,
+                                         )
         log.info("Database connection established")
 
     @app.on_event("shutdown")
