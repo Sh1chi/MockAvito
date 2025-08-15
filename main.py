@@ -7,6 +7,7 @@ from fastapi import FastAPI, Request
 from logging_cfg import setup
 from tokens import router as tokens_router
 from messenger import router as messenger_router
+from accounts import router as accounts_router
 from db import install_pool
 
 log = setup()
@@ -17,6 +18,7 @@ install_pool(app)
 # Подключаем mock-роутеры: OAuth и Messenger API
 app.include_router(tokens_router)
 app.include_router(messenger_router)
+app.include_router(accounts_router)
 
 
 @app.middleware("http")

@@ -3,6 +3,7 @@ asyncpg-пул, доступный из любого mock-роутера.
 """
 import asyncpg, logging
 from fastapi import FastAPI
+
 from config import DATABASE_URL
 
 pool: asyncpg.Pool | None = None   # будет заполнен при старте приложения
