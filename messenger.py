@@ -59,8 +59,8 @@ async def _ensure_chat(conn: asyncpg.Connection, avito_chat_id: str, users: Sequ
 
 
 async def _check_membership(conn: asyncpg.Connection, chat_pk: int, user_id: int) -> None:
-    """"
-    Возвращает список чатов пользователя (v2).
+    """
+    Проверяет, что user_id состоит в чате; иначе HTTP 403.
     """
     ok = await conn.fetchval(
         """
@@ -121,7 +121,7 @@ async def unsubscribe_webhook(sub_id: str):
     return {"ok": True}
 
 
-async def _broadcast(event: dict):
+async def _broadcast(event: dict, seller_user_id: int | None = None):
     """
     Рассылает событие всем подписанным вебхукам.
     Перед отправкой подставляет user_id подписчика в payload/value.
@@ -130,7 +130,9 @@ async def _broadcast(event: dict):
         return
     async with httpx.AsyncClient(timeout=10) as client:
         for sid, cfg in SUBSCRIBERS.items():
-            # не мутируем исходный объект
+            # если указан владелец — шлём только его подпискам
+            if seller_user_id is not None and cfg["user_id"] != seller_user_id:
+                continue
             payload = json.loads(json.dumps(event, ensure_ascii=False))
             payload["payload"]["value"]["user_id"] = cfg["user_id"]
             body = json.dumps(payload, ensure_ascii=False).encode()
@@ -151,6 +153,7 @@ async def simulate_inbound(
     text: str = Form(...),
     chat_id: str = Form("chat-001"),
     author_id: int = Form(555),
+    owner_id: int = Form(...),            # ← чей поток (продавец)
 ):
     """
     Создаёт входящее (in) сообщение в указанном чате и рассылает вебхуки.
@@ -161,7 +164,7 @@ async def simulate_inbound(
     avito_msg_id = f"m-{uuid.uuid4().hex[:12]}"
 
     async with db.pool.acquire() as conn:  # type: ignore[attr-defined]
-        chat_pk = await _ensure_chat(conn, chat_id)
+        chat_pk = await _ensure_chat(conn, chat_id, users=[owner_id])
         await conn.execute(
             """
             INSERT INTO mock_avito.messages
@@ -202,7 +205,7 @@ async def simulate_inbound(
             },
         },
     }
-    await _broadcast(event)
+    await _broadcast(event, seller_user_id=owner_id)  #  фильтрация по владельцу
     return {"ok": True, "avito_msg_id": avito_msg_id}
 
 
