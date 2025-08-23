@@ -86,13 +86,12 @@ def _sign(secret: str | bytes, body: bytes) -> str:
 
 
 @router.post("/messenger/v3/webhook")
-async def subscribe_webhook(body: dict):
+async def subscribe_webhook(body: dict, auth_user_id: int = Depends(check_bearer_token)):
     """
     Регистрирует вебхук в памяти мока.
     Параметры:
       - url (str) — куда отправлять события;
       - secret (str, опционально) — ключ для подписи;
-      - user_id (int) — чьи события слать.
     """
     url = body.get("url")
     if not url:
@@ -100,7 +99,7 @@ async def subscribe_webhook(body: dict):
 
     user_id = body.get("user_id")
     if user_id is None:
-        raise HTTPException(400, "'user_id' required")
+        user_id = auth_user_id
 
     sub_id = uuid.uuid4().hex
     SUBSCRIBERS[sub_id] = {
@@ -320,15 +319,31 @@ async def get_chat_info(
             int(chat["id"]),
         )
 
+    # гарантируем, что в context.value есть title (как в реальном Avito)
+    raw = chat["context_value"]
+
+    if isinstance(raw, (str, bytes)):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            raw = {}
+
+    if not isinstance(raw, dict):
+        raw = {}
+
+    if not raw.get("title"):
+        raw["title"] = f"Chat {chat['chat_id']}"
+
+    value = raw
+
     def _clean(record):
+        if record is None:
+            return None
         d = dict(record)
         return {k: v for k, v in d.items() if v is not None}
 
     return {
-        "context": {
-            "type": chat["context_type"],
-            "value": chat["context_value"],
-        },
+        "context": {"type": chat["context_type"] or "generic", "value": value},
         "created": chat["created"],
         "id": chat["chat_id"],
         "updated": chat["updated"],
